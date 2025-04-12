@@ -5,13 +5,16 @@ import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import org.json.JSONObject;
+import java.util.ArrayList;
+import java.util.List;
 
-public class BurpExtender implements IBurpExtender, IHttpListener, ITab {
+public class BurpExtender implements IBurpExtender, IHttpListener, ITab, IContextMenuFactory {
 
     private IBurpExtenderCallbacks callbacks;
     private IExtensionHelpers helpers;
 
     // Configuration fields
+    private boolean enableInterception = true;
     private String serverHost = "localhost";
     private int serverPort = 3333;
     private boolean filterInScope = true;
@@ -21,11 +24,12 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab {
     private JTextField hostField;
     private JTextField portField;
     private JCheckBox inScopeCheckBox;
+    private JCheckBox enableInterceptionCheckBox;
 
     @Override
     public void registerExtenderCallbacks(IBurpExtenderCallbacks callbacks) {
         // Set the name of the extension
-        callbacks.setExtensionName("jxscout burp");
+        callbacks.setExtensionName("JXScout");
 
         // Register the HTTP listener
         callbacks.registerHttpListener(this);
@@ -42,6 +46,9 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab {
 
         // Register the custom tab
         callbacks.addSuiteTab(this);
+
+        // Register the context menu factory
+        callbacks.registerContextMenuFactory(this);
     }
 
     private void initUI() {
@@ -79,9 +86,21 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab {
         gbc.fill = GridBagConstraints.HORIZONTAL;
         gbc.insets = new Insets(5, 5, 5, 5);
 
-        // Host field
+        // Enable Interception checkbox
         gbc.gridx = 0;
         gbc.gridy = 0;
+        gbc.weightx = 0.3;
+        configPanel.add(new JLabel("Enable Interception:"), gbc);
+
+        gbc.gridx = 1;
+        gbc.weightx = 0.7;
+        enableInterceptionCheckBox = new JCheckBox();
+        enableInterceptionCheckBox.setSelected(enableInterception);
+        configPanel.add(enableInterceptionCheckBox, gbc);
+
+        // Host field
+        gbc.gridx = 0;
+        gbc.gridy = 1;
         gbc.weightx = 0.3;
         configPanel.add(new JLabel("Server Host:"), gbc);
 
@@ -92,7 +111,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab {
 
         // Port field
         gbc.gridx = 0;
-        gbc.gridy = 1;
+        gbc.gridy = 2;
         gbc.weightx = 0.3;
         configPanel.add(new JLabel("Server Port:"), gbc);
 
@@ -103,7 +122,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab {
 
         // In-scope checkbox
         gbc.gridx = 0;
-        gbc.gridy = 2;
+        gbc.gridy = 3;
         gbc.weightx = 0.3;
         configPanel.add(new JLabel("Filter In-Scope:"), gbc);
 
@@ -133,13 +152,14 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab {
             serverHost = hostField.getText();
             serverPort = Integer.parseInt(portField.getText());
             filterInScope = inScopeCheckBox.isSelected();
-
+            enableInterception = enableInterceptionCheckBox.isSelected();
             // Save settings using Burp's persistence mechanism
             callbacks.saveExtensionSetting("serverHost", serverHost);
             callbacks.saveExtensionSetting("serverPort", String.valueOf(serverPort));
             callbacks.saveExtensionSetting("filterInScope", String.valueOf(filterInScope));
+            callbacks.saveExtensionSetting("enableInterception", String.valueOf(enableInterception));
 
-            callbacks.printOutput("Configuration saved: Host=" + serverHost + ", Port=" + serverPort + ", FilterInScope=" + filterInScope);
+            callbacks.printOutput("Configuration saved: Host=" + serverHost + ", Port=" + serverPort + ", FilterInScope=" + filterInScope + ", EnableInterception=" + enableInterception);
 
             // Show success message
             JOptionPane.showMessageDialog(mainPanel, "Settings saved successfully!", "Success", JOptionPane.INFORMATION_MESSAGE);
@@ -156,11 +176,12 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab {
         String savedHost = callbacks.loadExtensionSetting("serverHost");
         String savedPort = callbacks.loadExtensionSetting("serverPort");
         String savedFilterInScope = callbacks.loadExtensionSetting("filterInScope");
-
+        String savedEnableInterception = callbacks.loadExtensionSetting("enableInterception");
         // Apply loaded settings or use defaults if not set
         serverHost = (savedHost != null) ? savedHost : "localhost";
         serverPort = (savedPort != null) ? Integer.parseInt(savedPort) : 3333;
         filterInScope = (savedFilterInScope != null) ? Boolean.parseBoolean(savedFilterInScope) : true;
+        enableInterception = (savedEnableInterception != null) ? Boolean.parseBoolean(savedEnableInterception) : true;
     }
 
     @Override
@@ -169,8 +190,12 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab {
             byte[] request = message.getRequest();
             IRequestInfo requestInfo = helpers.analyzeRequest(message);
             URL requestUrl = requestInfo.getUrl();
-
+            
             if (filterInScope && !callbacks.isInScope(requestUrl)) {
+                return;
+            }
+            
+            if (!enableInterception) {
                 return;
             }
 
@@ -186,8 +211,10 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab {
                 jsonPayload.put("response", rawResponse);
 
                 sendToServer(jsonPayload);
+
+                callbacks.printOutput("Request/Response sent to JXScout server successfully");
             } catch (Exception e) {
-                callbacks.printError("Failed to process message: " + e.getMessage());
+                callbacks.printError("Error sending to JXScout server: " + e.getMessage());
             }
         }
     }
@@ -226,5 +253,39 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab {
     @Override
     public Component getUiComponent() {
         return mainPanel;
+    }
+
+    @Override
+    public List<JMenuItem> createMenuItems(IContextMenuInvocation invocation) {
+        List<JMenuItem> menuItems = new ArrayList<>();
+        
+        JMenuItem sendToServerMenuItem = new JMenuItem("Send to jxscout");
+        
+        sendToServerMenuItem.addActionListener(e -> {
+            IHttpRequestResponse[] messages = invocation.getSelectedMessages();
+            for (IHttpRequestResponse message : messages) {
+                try {
+                    byte[] request = message.getRequest();
+                    byte[] response = message.getResponse();
+                    IRequestInfo requestInfo = helpers.analyzeRequest(message);
+                    URL requestUrl = requestInfo.getUrl();
+                    
+                    JSONObject jsonPayload = new JSONObject();
+                    String urlWithoutPort = requestUrl.getProtocol() + "://" + requestUrl.getHost() + requestUrl.getFile();
+                    jsonPayload.put("requestUrl", urlWithoutPort);
+                    jsonPayload.put("request", new String(request));
+                    jsonPayload.put("response", new String(response));
+                    
+                    sendToServer(jsonPayload);
+                    
+                    callbacks.printOutput("Request/Response sent to JXScout server successfully");
+                } catch (Exception ex) {
+                    callbacks.printError("Error sending to JXScout server: " + ex.getMessage());
+                }
+            }
+        });
+        
+        menuItems.add(sendToServerMenuItem);
+        return menuItems;
     }
 }
