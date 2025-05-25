@@ -210,7 +210,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab, IContex
                 jsonPayload.put("request", rawRequest);
                 jsonPayload.put("response", rawResponse);
 
-                sendToServer(jsonPayload);
+                sendToServer(message);
 
                 callbacks.printOutput("Request/Response sent to JXScout server successfully");
             } catch (Exception e) {
@@ -219,28 +219,46 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab, IContex
         }
     }
 
-    private void sendToServer(JSONObject jsonPayload) {
+    private void sendToServer(IHttpRequestResponse message) {
         try {
+            byte[] request = message.getRequest();
+            byte[] response = message.getResponse();
+            IRequestInfo requestInfo = helpers.analyzeRequest(message);
+            URL requestUrl = requestInfo.getUrl();
+            
+            JSONObject jsonPayload = new JSONObject();
+            String urlWithoutPort = requestUrl.getProtocol() + "://" + requestUrl.getHost() + requestUrl.getFile();
+            jsonPayload.put("requestUrl", urlWithoutPort);
+            jsonPayload.put("request", new String(request));
+            jsonPayload.put("response", new String(response));
+            
+            // Send to JXScout server
             URL url = new URL("http://" + serverHost + ":" + serverPort + "/caido-ingest");
-            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-            connection.setRequestMethod("POST");
-            connection.setRequestProperty("Content-Type", "application/json");
-            connection.setDoOutput(true);
-
-            try (OutputStream os = connection.getOutputStream()) {
-                byte[] input = jsonPayload.toString().getBytes("utf-8");
-                os.write(input, 0, input.length);
+            IHttpService httpService = helpers.buildHttpService(
+                url.getHost(),
+                url.getPort() == -1 ? 80 : url.getPort(),
+                false
+            );
+            
+            // Build the request with headers and body
+            List<String> headers = new ArrayList<>();
+            headers.add("POST /caido-ingest HTTP/1.1");
+            headers.add("Host: " + url.getHost() + (url.getPort() != -1 ? ":" + url.getPort() : ""));
+            headers.add("Content-Type: application/json");
+            headers.add("Content-Length: " + jsonPayload.toString().getBytes("utf-8").length);
+            headers.add("");
+            
+            byte[] jxscoutRequest = helpers.buildHttpMessage(headers, jsonPayload.toString().getBytes("utf-8"));
+            
+            // Send request through Burp
+            IHttpRequestResponse jxscoutResponse = callbacks.makeHttpRequest(httpService, jxscoutRequest);
+            
+            if (jxscoutResponse != null && jxscoutResponse.getResponse() != null) {
+                callbacks.printOutput("Data sent to JXScout server successfully");
+            } else {
+                callbacks.printError("Failed to send data to JXScout server: No response received");
             }
-
-            try (BufferedReader br = new BufferedReader(new InputStreamReader(connection.getInputStream(), "utf-8"))) {
-                StringBuilder response = new StringBuilder();
-                String responseLine;
-                while ((responseLine = br.readLine()) != null) {
-                    response.append(responseLine.trim());
-                }
-            }
-
-        } catch (IOException e) {
+        } catch (Exception e) {
             callbacks.printError("Failed to send data to server: " + e.getMessage());
         }
     }
@@ -276,7 +294,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab, IContex
                     jsonPayload.put("request", new String(request));
                     jsonPayload.put("response", new String(response));
                     
-                    sendToServer(jsonPayload);
+                    sendToServer(message);
                     
                     callbacks.printOutput("Request/Response sent to JXScout server successfully");
                 } catch (Exception ex) {
@@ -286,6 +304,123 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab, IContex
         });
         
         menuItems.add(sendToServerMenuItem);
+
+        // Add new menu item for sending JavaScript files
+        JMenuItem sendJavaScriptFilesMenuItem = new JMenuItem("Send JavaScript files");
+        
+        sendJavaScriptFilesMenuItem.addActionListener(e -> {
+            IHttpRequestResponse[] messages = invocation.getSelectedMessages();
+            for (IHttpRequestResponse message : messages) {
+                try {
+                    byte[] response = message.getResponse();
+                    String responseStr = new String(response);
+                    IRequestInfo requestInfo = helpers.analyzeRequest(message);
+                    URL baseUrl = requestInfo.getUrl();
+                    
+                    // Extract JavaScript files from response
+                    List<String> jsFiles = extractJavaScriptFiles(responseStr, baseUrl);
+                    
+                    // Log all extracted URLs
+                    callbacks.printOutput("Found " + jsFiles.size() + " JavaScript files:");
+                    for (String jsFile : jsFiles) {
+                        callbacks.printOutput("  - " + jsFile);
+                    }
+                    
+                    // Create a new thread for downloading and sending files
+                    new Thread(() -> {
+                        for (String jsFile : jsFiles) {
+                            try {
+                                URL jsUrl = new URL(jsFile);
+                                
+                                // Create HTTP request using Burp's API
+                                byte[] request = helpers.buildHttpRequest(jsUrl);
+                                IHttpService httpService = helpers.buildHttpService(
+                                    jsUrl.getHost(),
+                                    jsUrl.getPort() == -1 ? (jsUrl.getProtocol().equals("https") ? 443 : 80) : jsUrl.getPort(),
+                                    jsUrl.getProtocol().equals("https")
+                                );
+                                
+                                IHttpRequestResponse jsResponse = callbacks.makeHttpRequest(
+                                    httpService,
+                                    request
+                                );
+                                
+                                if (jsResponse != null && jsResponse.getResponse() != null) {
+                                    // Send directly to JXScout
+                                    sendToServer(jsResponse);
+                                    callbacks.printOutput("JavaScript file sent to JXScout server: " + jsFile);
+                                } else {
+                                    callbacks.printError("Failed to fetch JavaScript file: " + jsFile);
+                                }
+                            } catch (Exception ex) {
+                                callbacks.printError("Error fetching JavaScript file " + jsFile + ": " + ex.getMessage());
+                            }
+                        }
+                    }).start();
+                    
+                } catch (Exception ex) {
+                    callbacks.printError("Error processing JavaScript files: " + ex.getMessage());
+                }
+            }
+        });
+        
+        menuItems.add(sendJavaScriptFilesMenuItem);
         return menuItems;
+    }
+
+    private List<String> extractJavaScriptFiles(String response, URL baseUrl) {
+        List<String> jsFiles = new ArrayList<>();
+        String pattern = "<script[^>]*src=[\"']([^\"']+)[\"'][^>]*>";
+        java.util.regex.Pattern p = java.util.regex.Pattern.compile(pattern);
+        java.util.regex.Matcher m = p.matcher(response);
+        
+        while (m.find()) {
+            String jsPath = m.group(1);
+            try {
+                // Handle different URL formats
+                String absoluteUrl;
+                if (jsPath.startsWith("http://") || jsPath.startsWith("https://")) {
+                    // Already absolute URL
+                    absoluteUrl = jsPath;
+                } else if (jsPath.startsWith("//")) {
+                    // Protocol-relative URL
+                    absoluteUrl = baseUrl.getProtocol() + ":" + jsPath;
+                } else if (jsPath.startsWith("/")) {
+                    // Root-relative URL
+                    absoluteUrl = baseUrl.getProtocol() + "://" + baseUrl.getHost() + 
+                                (baseUrl.getPort() != -1 ? ":" + baseUrl.getPort() : "") + 
+                                jsPath;
+                } else {
+                    // Relative URL - need to handle the base path correctly
+                    String basePath = baseUrl.getPath();
+                    // Remove the filename from the base path to get the directory
+                    String baseDir = basePath.substring(0, basePath.lastIndexOf('/') + 1);
+                    // Combine the base directory with the relative path
+                    String combinedPath = baseDir + jsPath;
+                    // Normalize the path (remove any ".." or "." segments)
+                    try {
+                        java.net.URI normalizedUri = new java.net.URI(null, null, combinedPath, null).normalize();
+                        absoluteUrl = baseUrl.getProtocol() + "://" + baseUrl.getHost() + 
+                                    (baseUrl.getPort() != -1 ? ":" + baseUrl.getPort() : "") + 
+                                    normalizedUri.getPath();
+                    } catch (Exception e) {
+                        // If normalization fails, use the combined path as is
+                        absoluteUrl = baseUrl.getProtocol() + "://" + baseUrl.getHost() + 
+                                    (baseUrl.getPort() != -1 ? ":" + baseUrl.getPort() : "") + 
+                                    combinedPath;
+                    }
+                }
+                
+                // Normalize URL (remove double slashes except after protocol)
+                absoluteUrl = absoluteUrl.replaceAll("(?<!:)//+", "/");
+                
+                jsFiles.add(absoluteUrl);
+                callbacks.printOutput("Found JavaScript file: " + absoluteUrl);
+            } catch (Exception e) {
+                callbacks.printError("Error processing JavaScript URL: " + jsPath + " - " + e.getMessage());
+            }
+        }
+        
+        return jsFiles;
     }
 }
