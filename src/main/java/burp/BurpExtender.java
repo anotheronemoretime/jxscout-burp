@@ -281,26 +281,17 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab, IContex
         
         sendToServerMenuItem.addActionListener(e -> {
             IHttpRequestResponse[] messages = invocation.getSelectedMessages();
-            for (IHttpRequestResponse message : messages) {
-                try {
-                    byte[] request = message.getRequest();
-                    byte[] response = message.getResponse();
-                    IRequestInfo requestInfo = helpers.analyzeRequest(message);
-                    URL requestUrl = requestInfo.getUrl();
-                    
-                    JSONObject jsonPayload = new JSONObject();
-                    String urlWithoutPort = requestUrl.getProtocol() + "://" + requestUrl.getHost() + requestUrl.getFile();
-                    jsonPayload.put("requestUrl", urlWithoutPort);
-                    jsonPayload.put("request", new String(request));
-                    jsonPayload.put("response", new String(response));
-                    
-                    sendToServer(message);
-                    
-                    callbacks.printOutput("Request/Response sent to JXScout server successfully");
-                } catch (Exception ex) {
-                    callbacks.printError("Error sending to JXScout server: " + ex.getMessage());
+            // Move HTTP request to a separate thread
+            new Thread(() -> {
+                for (IHttpRequestResponse message : messages) {
+                    try {
+                        sendToServer(message);
+                        callbacks.printOutput("Request/Response sent to JXScout server successfully");
+                    } catch (Exception ex) {
+                        callbacks.printError("Error sending to JXScout server: " + ex.getMessage());
+                    }
                 }
-            }
+            }).start();
         });
         
         menuItems.add(sendToServerMenuItem);
@@ -310,24 +301,25 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab, IContex
         
         sendJavaScriptFilesMenuItem.addActionListener(e -> {
             IHttpRequestResponse[] messages = invocation.getSelectedMessages();
-            for (IHttpRequestResponse message : messages) {
-                try {
-                    byte[] response = message.getResponse();
-                    String responseStr = new String(response);
-                    IRequestInfo requestInfo = helpers.analyzeRequest(message);
-                    URL baseUrl = requestInfo.getUrl();
-                    
-                    // Extract JavaScript files from response
-                    List<String> jsFiles = extractJavaScriptFiles(responseStr, baseUrl);
-                    
-                    // Log all extracted URLs
-                    callbacks.printOutput("Found " + jsFiles.size() + " JavaScript files:");
-                    for (String jsFile : jsFiles) {
-                        callbacks.printOutput("  - " + jsFile);
-                    }
-                    
-                    // Create a new thread for downloading and sending files
-                    new Thread(() -> {
+            // Move HTTP requests to a separate thread
+            new Thread(() -> {
+                for (IHttpRequestResponse message : messages) {
+                    try {
+                        byte[] response = message.getResponse();
+                        String responseStr = new String(response);
+                        IRequestInfo requestInfo = helpers.analyzeRequest(message);
+                        URL baseUrl = requestInfo.getUrl();
+                        
+                        // Extract JavaScript files from response
+                        List<String> jsFiles = extractJavaScriptFiles(responseStr, baseUrl);
+                        
+                        // Log all extracted URLs
+                        callbacks.printOutput("Found " + jsFiles.size() + " JavaScript files:");
+                        for (String jsFile : jsFiles) {
+                            callbacks.printOutput("  - " + jsFile);
+                        }
+                        
+                        // Process each JavaScript file
                         for (String jsFile : jsFiles) {
                             try {
                                 URL jsUrl = new URL(jsFile);
@@ -356,12 +348,11 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab, IContex
                                 callbacks.printError("Error fetching JavaScript file " + jsFile + ": " + ex.getMessage());
                             }
                         }
-                    }).start();
-                    
-                } catch (Exception ex) {
-                    callbacks.printError("Error processing JavaScript files: " + ex.getMessage());
+                    } catch (Exception ex) {
+                        callbacks.printError("Error processing JavaScript files: " + ex.getMessage());
+                    }
                 }
-            }
+            }).start();
         });
         
         menuItems.add(sendJavaScriptFilesMenuItem);
